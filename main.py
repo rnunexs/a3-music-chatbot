@@ -11,6 +11,7 @@ from pathlib import Path
 import uuid
 import sys
 import davey
+import math
 
 load_dotenv()
 
@@ -25,6 +26,8 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODELO = "gemini-3.5-flash-lite"
 
 carregando = set()
+
+
 
 
 # ---------- HISTÓRICO ----------
@@ -100,26 +103,41 @@ async def reset(ctx):
 
 YDL_OPTS = {
     "format": "bestaudio/best",
-    "noplaylist": True,
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+    "playlistend": 200,
     "quiet": True,
     "default_search": "ytsearch",
 }
 
 
 filas = {}
+tocando_agora = {}
 
 
 def extrair(consulta):
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(consulta, download=False)
         if "entries" in info:
-            info = info["entries"][0]
-        return {
-            "titulo": info["title"],
-            "pagina": info["webpage_url"],
-            "url": info["url"],
-            "headers": info.get("http_headers", {}),
-        }
+            entradas = info["entries"]
+        else:
+            entradas = [info]
+        musicas = []
+        for item in entradas:
+            if not item:
+                continue
+            titulo = item.get("title")
+            if not titulo or titulo in ("[Private video]", "[Deleted video]"):
+                continue
+            pagina = item.get("webpage_url") or item.get("url")
+            if pagina and not pagina.startswith("http"):
+                pagina = f"https://www.youtube.com/watch?v={pagina}"
+            if pagina:
+                musicas.append({
+                    "titulo": titulo,
+                    "pagina": pagina,
+                })
+        return musicas
 
 PASTA = Path(__file__).parent / "temp"
 PASTA.mkdir(exist_ok=True)
@@ -171,8 +189,10 @@ async def tocar_proxima(ctx):
         except OSError:
             pass
         asyncio.run_coroutine_threadsafe(tocar_proxima(ctx), loop)
+
+    tocando_agora[ctx.guild.id] = musica
     vc.play(fonte, after=depois)
-    await ctx.send(f"Tocando: **{musica['titulo']}**")
+    await ctx.send(f"▶️ Tocando: **{musica['titulo']}**")
 
 
 @bot.command()
@@ -181,30 +201,120 @@ async def play(ctx, *, busca: str):
     if not ctx.author.voice:
         await ctx.send("Entra em um canal de voz primeiro.")
         return
-
     canal = ctx.author.voice.channel
     if ctx.voice_client is None:
         await canal.connect()
     elif ctx.voice_client.channel != canal:
         await ctx.voice_client.move_to(canal)
-
     async with ctx.typing():
         try:
             loop = asyncio.get_running_loop()
-            info = await loop.run_in_executor(None, extrair, busca)
+            musicas = await loop.run_in_executor(None, extrair, busca)
         except Exception as e:
             print(f"Erro yt-dlp: {e}")
-            await ctx.send("Não consegui achar essa música.")
+            await ctx.send("Não consegui achar essa música ou playlist.")
             return
-
-    filas.setdefault(ctx.guild.id, []).append(info)
-
-    vc = ctx.voice_client
-    if vc.is_playing() or vc.is_paused() or ctx.guild.id in carregando:
-        await ctx.send(f"Adicionado à fila: **{info['titulo']}**")
+    if not musicas:
+        await ctx.send("Nenhuma música válida encontrada.")
+        return
+    filas.setdefault(ctx.guild.id, []).extend(musicas)
+    if len(musicas) > 1:
+        await ctx.send(f"Adicionadas **{len(musicas)} músicas** da playlist à fila!")
+        if not ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            await tocar_proxima(ctx)
     else:
-        await tocar_proxima(ctx)
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            await ctx.send(f"Adicionado à fila: **{musicas[0]['titulo']}**")
+        else:
+            await tocar_proxima(ctx)
 
+@bot.command(name="current-song", aliases=["now-playing", "atual", "np"])
+@commands.guild_only()
+async def current_song(ctx):
+    musica = tocando_agora.get(ctx.guild.id)
+    if not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()) or not musica:
+        await ctx.send("Não há música tocando neste momento")
+        return
+
+    status = "⏸️ Pausada" if ctx.voice_client.is_paused() else "▶️ Tocando agora"
+    await ctx.send(f"{status}: **{musica['titulo']}**\n\n{musica['pagina']}")
+
+class FilaView(discord.ui.View):
+
+    def __init__(self, guild_id: int, pagina: int = 1):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.pagina = pagina
+        self.itens_por_pagina = 10
+        self.atualizar_botoes()
+
+    def total_paginas(self) -> int:
+        fila = filas.get(self.guild_id, [])
+        return max(1, math.ceil(len(fila) / self.itens_por_pagina))
+
+    def atualizar_botoes(self):
+        total = self.total_paginas()
+        self.pagina = max(1, min(self.pagina, total))
+        self.btn_anterior.disabled = self.pagina <= 1
+        self.btn_proxima.disabled = self.pagina >= total
+
+    def criar_embed(self) -> discord.Embed:
+        atual = tocando_agora.get(self.guild_id)
+        fila = filas.get(self.guild_id, [])
+        total = self.total_paginas()
+        self.atualizar_botoes()
+        partes = []
+        if atual:
+            partes.append(f"**▶️ Tocando agora:**\n[{atual['titulo']}]({atual['pagina']})\n")
+        if fila:
+            inicio = (self.pagina - 1) * self.itens_por_pagina
+            fim = inicio + self.itens_por_pagina
+            linhas = []
+            for i, m in enumerate(fila[inicio:fim], start=inicio + 1):
+                # Corta títulos muito grandes e remove colchetes que quebram o link
+                titulo = m["titulo"].replace("[", "(").replace("]", ")")
+                if len(titulo) > 60:
+                    titulo = titulo[:57] + "..."
+                linhas.append(f"**{i}.** [{titulo}]({m['pagina']})")
+            partes.append(f"**📋 Próximas na fila ({len(fila)} no total):**\n" + "\n".join(linhas))
+        else:
+            partes.append("**📋 Próximas na fila:**\nNenhuma música na fila.")
+        embed = discord.Embed(
+            title="🎵 Fila de Músicas",
+            description="\n".join(partes),
+            color=discord.Color.from_str("#1C5FF1"),
+        )
+        if fila:
+            embed.set_footer(text=f"Página {self.pagina}/{total}")
+        return embed
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary)
+    async def btn_anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina -= 1
+        embed = self.criar_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Próxima", style=discord.ButtonStyle.secondary)
+    async def btn_proxima(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina += 1
+        embed = self.criar_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+@bot.command(aliases=["fila", "q"])
+@commands.guild_only()
+async def queue(ctx, pagina: int = 1):
+    atual = tocando_agora.get(ctx.guild.id)
+    fila = filas.get(ctx.guild.id, [])
+    if not atual and not fila:
+        await ctx.send("A fila está vazia.")
+        return
+    view = FilaView(ctx.guild.id, pagina)
+    embed = view.criar_embed()
+    # Só mostra os botões se houver mais de 1 página
+    if view.total_paginas() > 1:
+        await ctx.send(embed=embed, view=view)
+    else:
+        await ctx.send(embed=embed)
 
 @bot.command()
 @commands.guild_only()
@@ -245,12 +355,14 @@ async def stop(ctx):
 @commands.guild_only()
 async def leave(ctx):
     filas[ctx.guild.id] = []
+    tocando_agora.pop(ctx.guild.id, None)
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
+        await ctx.send("Parei e saí do canal.")
     else:
         await ctx.voice_client.disconnect()
-    await ctx.send("Parei e saí do canal.")
+        await  ctx.send("Saí do canal.")
 
 @bot.command()
 @commands.guild_only()
