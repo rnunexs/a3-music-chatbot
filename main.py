@@ -213,6 +213,25 @@ async def skip(ctx):
         ctx.voice_client.stop()  # o "after" chama a próxima sozinho
         await ctx.send("Pulei.")
 
+@bot.command()
+@commands.guild_only()
+async def pause(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        await ctx.voice_client.pause()
+    elif ctx.voice_client and ctx.voice_client.is_paused():
+        await ctx.send("A música já está pausada.")
+    else:
+        await ctx.send("Não há nada tocando no momento.")
+
+@bot.command()
+@commands.guild_only()
+async def resume(ctx):
+    vc = ctx.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await ctx.send("Música retomada.")
+    else:
+        await ctx.send("A música não está pausada.")
 
 @bot.command()
 @commands.guild_only()
@@ -220,6 +239,16 @@ async def stop(ctx):
     filas[ctx.guild.id] = []
     if ctx.voice_client:
         ctx.voice_client.stop()
+    await ctx.send("Parei e Limpei a fila!")
+
+@bot.command()
+@commands.guild_only()
+async def leave(ctx):
+    filas[ctx.guild.id] = []
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.voice_client.disconnect()
+    else:
         await ctx.voice_client.disconnect()
     await ctx.send("Parei e saí do canal.")
 
