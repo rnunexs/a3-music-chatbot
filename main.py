@@ -359,7 +359,7 @@ async def leave(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-        await ctx.send("Parei e saí do canal.")
+        await ctx.send("Parei de tocar e saí do canal.")
     else:
         await ctx.voice_client.disconnect()
         await  ctx.send("Saí do canal.")
