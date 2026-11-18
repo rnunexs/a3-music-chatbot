@@ -8,6 +8,9 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from pathlib import Path
+import uuid
+import sys
+import davey
 
 load_dotenv()
 
@@ -21,8 +24,12 @@ bot = commands.Bot("!", intents=intents)
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODELO = "gemini-3.5-flash-lite"
 
+carregando = set()
+
 
 # ---------- HISTÓRICO ----------
+
+
 
 def carregar():
     if HISTORICO.exists():
@@ -118,11 +125,12 @@ PASTA = Path(__file__).parent / "temp"
 PASTA.mkdir(exist_ok=True)
 
 def baixar(pagina):
+    uid = uuid.uuid4().hex[:8]
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
-        "outtmpl": str(PASTA / "%(id)s.%(ext)s"),
+        "outtmpl": str(PASTA / f"{uid}_%(id)s.%(ext)s"),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(pagina, download=True)
@@ -131,23 +139,30 @@ def baixar(pagina):
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
 async def tocar_proxima(ctx):
-    fila = filas.get(ctx.guild.id)
+    gid = ctx.guild.id
+    fila = filas.get(gid)
     vc = ctx.voice_client
-    if not fila or not vc:
+    if not fila or not vc or gid in carregando:
         return
-
+    carregando.add(gid)
     musica = fila.pop(0)
     loop = asyncio.get_running_loop()
     try:
         arquivo = await loop.run_in_executor(None, baixar, musica["pagina"])
     except Exception as e:
+        carregando.discard(gid)
         print(f"Erro yt-dlp: {e}")
         await ctx.send(f"Não consegui tocar **{musica['titulo']}**, pulando.")
         await tocar_proxima(ctx)
         return
-
+    carregando.discard(gid)
+    if not ctx.voice_client:  # In case !stop was called while downloading
+        try:
+            os.remove(arquivo)
+        except OSError:
+            pass
+        return
     fonte = discord.FFmpegPCMAudio(arquivo, executable=FFMPEG_PATH, options="-vn")
-
     def depois(erro):
         if erro:
             print(f"Erro no áudio: {erro}")
@@ -155,8 +170,7 @@ async def tocar_proxima(ctx):
             os.remove(arquivo)
         except OSError:
             pass
-        asyncio.run_coroutine_threadsafe(tocar_proxima(ctx), bot.loop)
-
+        asyncio.run_coroutine_threadsafe(tocar_proxima(ctx), loop)
     vc.play(fonte, after=depois)
     await ctx.send(f"Tocando: **{musica['titulo']}**")
 
@@ -186,7 +200,7 @@ async def play(ctx, *, busca: str):
     filas.setdefault(ctx.guild.id, []).append(info)
 
     vc = ctx.voice_client
-    if vc.is_playing() or vc.is_paused():
+    if vc.is_playing() or vc.is_paused() or ctx.guild.id in carregando:
         await ctx.send(f"Adicionado à fila: **{info['titulo']}**")
     else:
         await tocar_proxima(ctx)
@@ -217,13 +231,25 @@ async def beep(ctx):
         return
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
+    elif ctx.voice_client.channel != ctx.author.voice.channel:
+        await ctx.voice_client.move_to(ctx.author.voice.channel)
+    vc = ctx.voice_client
+    conn = vc._connection
+    s = conn.dave_session
+    print(f"Iniciando beep | davey={davey.__version__} | mode={vc.mode} | dave_ver={conn.dave_protocol_version} | can_encrypt={conn.can_encrypt}")
+    if s:
+        print(f" Antes -> status={s.status} | ready={s.ready} | epoch={s.epoch}")
     fonte = discord.FFmpegPCMAudio(
         "sine=frequency=440:duration=5",
         executable=FFMPEG_PATH,
         before_options="-f lavfi",
         options="-vn",
+        stderr=sys.stderr,
     )
-    ctx.voice_client.play(fonte)
+    def fim(e):
+        s2 = conn.dave_session
+        print(f"Fim do beep | erro={e} | can_encrypt={conn.can_encrypt} | status={getattr(s2, 'status', None)} | ready={getattr(s2, 'ready', None)} | stats={s2.get_encryption_stats().successes if s2 else None}")
+    vc.play(fonte, after=fim)
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
