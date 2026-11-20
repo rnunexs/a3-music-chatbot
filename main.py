@@ -1,23 +1,27 @@
-import os
-import json
 import asyncio
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any
+import uuid
+import davey
 import discord
-import yt_dlp
 from discord.ext import commands
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from pathlib import Path
-import uuid
-import sys
-import davey
-import math
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+import yt_dlp
 
 load_dotenv()
 
 ARQUIVO_AGENTE = Path(__file__).parent / "agente.txt"
 HISTORICO = Path(__file__).parent / "historico.json"
-LIMITE = 100  # mensagens guardadas por canal (use número par)
+LIMITE = 200  # mensagens guardadas por canal (use número par)
 
 intents = discord.Intents.all()
 bot = commands.Bot("!", intents=intents)
@@ -27,6 +31,19 @@ MODELO = "gemini-3.5-flash-lite"
 
 carregando = set()
 
+sp = None
+if os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET"):
+    auth_sp = SpotifyOAuth(
+        client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+        client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+        redirect_uri="http://127.0.0.1:8888/callback",
+        scope="playlist-read-private playlist-read-collaborative",
+    )
+    auth_sp.get_access_token(as_dict=False)
+    sp = spotipy.Spotify(auth_manager=auth_sp)
+SPOTIFY_REGEX = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]+/)?(track|playlist|album)/([a-zA-Z0-9]+)"
+)
 
 
 
@@ -101,11 +118,12 @@ async def reset(ctx):
 
 # ---------- MÚSICA ----------
 
-YDL_OPTS = {
+LIMITE_PLAYLIST = 200
+
+YDL_OPTS: Any = {
     "format": "bestaudio/best",
-    "noplaylist": False,
+    "noplaylist": True,            # <-- Deixe True!
     "extract_flat": "in_playlist",
-    "playlistend": 200,
     "quiet": True,
     "default_search": "ytsearch",
 }
@@ -115,58 +133,149 @@ filas = {}
 tocando_agora = {}
 
 
+def extrair_spotify(url):
+    if not sp:
+        raise RuntimeError("Chaves do Spotify não configuradas no .env")
+    match = SPOTIFY_REGEX.search(url)
+    if not match:
+        return []
+
+    tipo, sp_id = match.groups()
+    musicas = []
+
+    if tipo == "track":
+        t = sp.track(sp_id)
+        artistas = ", ".join(a["name"] for a in t["artists"])
+        titulo = f"{artistas} - {t['name']}"
+        link = t["external_urls"]["spotify"]
+        musicas.append({
+            "titulo": titulo,
+            "pagina": link,
+            "download": f"ytsearch1:{titulo}",
+        })
+
+    elif tipo == "album":
+        resultados = sp.album_tracks(sp_id, limit=50)
+        itens = resultados["items"]
+        while resultados["next"]:
+            resultados = sp.next(resultados)
+            itens.extend(resultados["items"])
+
+        for t in itens:
+            artistas = ", ".join(a["name"] for a in t.get("artists", []))
+            titulo = f"{artistas} - {t['name']}"
+            link = t.get("external_urls", {}).get("spotify", url)
+            musicas.append({
+                "titulo": titulo,
+                "pagina": link,
+                "download": f"ytsearch1:{titulo}",
+            })
+
+    elif tipo == "playlist":
+        resultados = sp.playlist_items(sp_id, limit=50, additional_types=("track",))
+        itens = resultados["items"]
+        # Continua buscando até o final da playlist (seja 100, 800 ou mais músicas)
+        while resultados["next"]:
+            resultados = sp.next(resultados)
+            itens.extend(resultados["items"])
+
+        for item in itens:
+            t = item.get("track") or item.get("item")
+            if not t or not t.get("name"):
+                continue
+            artistas = ", ".join(a["name"] for a in t.get("artists", []))
+            titulo = f"{artistas} - {t['name']}"
+            link = t.get("external_urls", {}).get("spotify", url)
+            musicas.append({
+                "titulo": titulo,
+                "pagina": link,
+                "download": f"ytsearch1:{titulo}",
+            })
+
+    return musicas
+
+
 def extrair(consulta):
+    if "open.spotify.com" in consulta:
+        return extrair_spotify(consulta)
+
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(consulta, download=False)
+        info: Any = ydl.extract_info(consulta, download=False)
         if "entries" in info:
-            entradas = info["entries"]
+            entradas = list(info["entries"])
         else:
             entradas = [info]
+
         musicas = []
         for item in entradas:
             if not item:
                 continue
+
+            pagina = item.get("webpage_url") or item.get("url")
+            if not pagina:
+                continue
+
             titulo = item.get("title")
+
+            if not titulo and "soundcloud.com" in pagina:
+                partes = pagina.split("?")[0].rstrip("/").split("/")
+                if "api" not in pagina and len(partes) >= 2:
+                    titulo = f"{partes[-2]} - {partes[-1]}".replace("-", " ").title()
+                else:
+                    titulo = f"SoundCloud Track #{item.get('id', '')}"
+
             if not titulo or titulo in ("[Private video]", "[Deleted video]"):
                 continue
-            pagina = item.get("webpage_url") or item.get("url")
-            if pagina and not pagina.startswith("http"):
+
+            if not pagina.startswith("http"):
                 pagina = f"https://www.youtube.com/watch?v={pagina}"
-            if pagina:
-                musicas.append({
-                    "titulo": titulo,
-                    "pagina": pagina,
-                })
+
+            musicas.append({
+                "titulo": titulo,
+                "pagina": pagina,
+                "download": pagina,
+            })
+
         return musicas
+
 
 PASTA = Path(__file__).parent / "temp"
 PASTA.mkdir(exist_ok=True)
 
-def baixar(pagina):
+
+def baixar(alvo):
     uid = uuid.uuid4().hex[:8]
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
+        "default_search": "ytsearch",
         "outtmpl": str(PASTA / f"{uid}_%(id)s.%(ext)s"),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(pagina, download=True)
+        info = ydl.extract_info(alvo, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
         return ydl.prepare_filename(info)
+
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
+
 async def tocar_proxima(ctx):
     gid = ctx.guild.id
+    if gid in carregando:
+        return
     fila = filas.get(gid)
-    vc = ctx.voice_client
-    if not fila or not vc or gid in carregando:
+    if not fila or not ctx.voice_client:
+        tocando_agora.pop(gid, None)
         return
     carregando.add(gid)
     musica = fila.pop(0)
     loop = asyncio.get_running_loop()
     try:
-        arquivo = await loop.run_in_executor(None, baixar, musica["pagina"])
+        alvo = musica.get("download", musica["pagina"])
+        arquivo = await loop.run_in_executor(None, baixar, alvo)
     except Exception as e:
         carregando.discard(gid)
         print(f"Erro yt-dlp: {e}")
@@ -174,13 +283,14 @@ async def tocar_proxima(ctx):
         await tocar_proxima(ctx)
         return
     carregando.discard(gid)
-    if not ctx.voice_client:  # In case !stop was called while downloading
+    if not ctx.voice_client:
         try:
             os.remove(arquivo)
         except OSError:
             pass
         return
     fonte = discord.FFmpegPCMAudio(arquivo, executable=FFMPEG_PATH, options="-vn")
+
     def depois(erro):
         if erro:
             print(f"Erro no áudio: {erro}")
@@ -191,7 +301,7 @@ async def tocar_proxima(ctx):
         asyncio.run_coroutine_threadsafe(tocar_proxima(ctx), loop)
 
     tocando_agora[ctx.guild.id] = musica
-    vc.play(fonte, after=depois)
+    ctx.voice_client.play(fonte, after=depois)
     await ctx.send(f"▶️ Tocando: **{musica['titulo']}**")
 
 
@@ -206,24 +316,29 @@ async def play(ctx, *, busca: str):
         await canal.connect()
     elif ctx.voice_client.channel != canal:
         await ctx.voice_client.move_to(canal)
+
     async with ctx.typing():
         try:
             loop = asyncio.get_running_loop()
             musicas = await loop.run_in_executor(None, extrair, busca)
         except Exception as e:
-            print(f"Erro yt-dlp: {e}")
+            print(f"Erro na extração: {e}")
             await ctx.send("Não consegui achar essa música ou playlist.")
             return
+
     if not musicas:
         await ctx.send("Nenhuma música válida encontrada.")
         return
+
     filas.setdefault(ctx.guild.id, []).extend(musicas)
+    ocupado = ctx.voice_client.is_playing() or ctx.voice_client.is_paused() or ctx.guild.id in carregando
+
     if len(musicas) > 1:
         await ctx.send(f"Adicionadas **{len(musicas)} músicas** da playlist à fila!")
-        if not ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+        if not ocupado:
             await tocar_proxima(ctx)
     else:
-        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+        if ocupado:
             await ctx.send(f"Adicionado à fila: **{musicas[0]['titulo']}**")
         else:
             await tocar_proxima(ctx)
@@ -327,7 +442,8 @@ async def skip(ctx):
 @commands.guild_only()
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
-        await ctx.voice_client.pause()
+        ctx.voice_client.pause()
+        await ctx.send("Música pausada.")
     elif ctx.voice_client and ctx.voice_client.is_paused():
         await ctx.send("A música já está pausada.")
     else:
@@ -354,6 +470,9 @@ async def stop(ctx):
 @bot.command()
 @commands.guild_only()
 async def leave(ctx):
+    if not ctx.voice_client:
+        await ctx.send("Não estou em nenhum canal de voz.")
+        return
     filas[ctx.guild.id] = []
     tocando_agora.pop(ctx.guild.id, None)
     if ctx.voice_client and ctx.voice_client.is_playing():
