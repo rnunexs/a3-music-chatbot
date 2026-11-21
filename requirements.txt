@@ -1,0 +1,11 @@
+davey==0.1.7
+
+discord.py[voice]
+
+google-genai
+
+python-dotenv
+
+spotipy
+
+yt-dlp

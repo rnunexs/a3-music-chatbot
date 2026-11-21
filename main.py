@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import yt_dlp
+import random
+from discord import app_commands
 
 load_dotenv()
 
@@ -24,7 +26,7 @@ HISTORICO = Path(__file__).parent / "historico.json"
 LIMITE = 200  # mensagens guardadas por canal (use número par)
 
 intents = discord.Intents.all()
-bot = commands.Bot("!", intents=intents)
+bot = commands.Bot("!", intents=intents, help_command=None)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODELO = "gemini-3.5-flash-lite"
@@ -66,8 +68,8 @@ memoria = carregar()
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print("Musik inicializado com sucesso")
-
 
 # ---------- IA ----------
 
@@ -131,6 +133,11 @@ YDL_OPTS: Any = {
 
 filas = {}
 tocando_agora = {}
+historico_musicas = {}
+autoplay_ativo = set()
+autoshuffle_ativo = set()
+proxima_forcada = {}
+ignorar_historico = set()
 
 
 def extrair_spotify(url):
@@ -266,12 +273,31 @@ async def tocar_proxima(ctx):
     gid = ctx.guild.id
     if gid in carregando:
         return
-    fila = filas.get(gid)
-    if not fila or not ctx.voice_client:
+    if not ctx.voice_client:
         tocando_agora.pop(gid, None)
         return
+
+    fila = filas.get(gid, [])
+    veio_do_autoplay = False
+
+    if gid in proxima_forcada:
+        musica = proxima_forcada.pop(gid)
+    elif fila:
+        musica = fila.pop(0)
+    elif gid in autoplay_ativo:
+        carregando.add(gid)
+        musica = await recomendar_musica(gid)
+        carregando.discard(gid)
+        if not musica:
+            tocando_agora.pop(gid, None)
+            await ctx.channel.send("Não consegui recomendar a próxima música no autoplay.")
+            return
+        veio_do_autoplay = True
+    else:
+        tocando_agora.pop(gid, None)
+        return
+
     carregando.add(gid)
-    musica = fila.pop(0)
     loop = asyncio.get_running_loop()
     try:
         alvo = musica.get("download", musica["pagina"])
@@ -279,16 +305,18 @@ async def tocar_proxima(ctx):
     except Exception as e:
         carregando.discard(gid)
         print(f"Erro yt-dlp: {e}")
-        await ctx.send(f"Não consegui tocar **{musica['titulo']}**, pulando.")
+        await ctx.channel.send(f"Não consegui tocar **{musica['titulo']}**, pulando.")
         await tocar_proxima(ctx)
         return
     carregando.discard(gid)
+
     if not ctx.voice_client:
         try:
             os.remove(arquivo)
         except OSError:
             pass
         return
+
     fonte = discord.FFmpegPCMAudio(arquivo, executable=FFMPEG_PATH, options="-vn")
 
     def depois(erro):
@@ -298,16 +326,21 @@ async def tocar_proxima(ctx):
             os.remove(arquivo)
         except OSError:
             pass
+        if gid in ignorar_historico:
+            ignorar_historico.discard(gid)
+        else:
+            historico_musicas.setdefault(gid, []).append(musica)
         asyncio.run_coroutine_threadsafe(tocar_proxima(ctx), loop)
 
-    tocando_agora[ctx.guild.id] = musica
+    tocando_agora[gid] = musica
     ctx.voice_client.play(fonte, after=depois)
-    await ctx.send(f"▶️ Tocando: **{musica['titulo']}**")
+    prefixo = "🤖 Autoplay tocando" if veio_do_autoplay else "▶️ Tocando"
+    await ctx.channel.send(f"{prefixo}: **{musica['titulo']}**")
 
-
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def play(ctx, *, busca: str):
+    await ctx.defer()
     if not ctx.author.voice:
         await ctx.send("Entra em um canal de voz primeiro.")
         return
@@ -330,7 +363,13 @@ async def play(ctx, *, busca: str):
         await ctx.send("Nenhuma música válida encontrada.")
         return
 
+    if not musicas:
+        await ctx.send("Nenhuma música válida encontrada.")
+        return
+
     filas.setdefault(ctx.guild.id, []).extend(musicas)
+    if ctx.guild.id in autoshuffle_ativo:
+        random.shuffle(filas[ctx.guild.id])
     ocupado = ctx.voice_client.is_playing() or ctx.voice_client.is_paused() or ctx.guild.id in carregando
 
     if len(musicas) > 1:
@@ -415,7 +454,7 @@ class FilaView(discord.ui.View):
         embed = self.criar_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
-@bot.command(aliases=["fila", "q"])
+@bot.hybrid_command(aliases=["fila", "q"])
 @commands.guild_only()
 async def queue(ctx, pagina: int = 1):
     atual = tocando_agora.get(ctx.guild.id)
@@ -431,14 +470,14 @@ async def queue(ctx, pagina: int = 1):
     else:
         await ctx.send(embed=embed)
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()  # o "after" chama a próxima sozinho
         await ctx.send("Pulei.")
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
@@ -449,7 +488,7 @@ async def pause(ctx):
     else:
         await ctx.send("Não há nada tocando no momento.")
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def resume(ctx):
     vc = ctx.voice_client
@@ -459,7 +498,7 @@ async def resume(ctx):
     else:
         await ctx.send("A música não está pausada.")
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def stop(ctx):
     filas[ctx.guild.id] = []
@@ -467,7 +506,7 @@ async def stop(ctx):
         ctx.voice_client.stop()
     await ctx.send("Parei e Limpei a fila!")
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def leave(ctx):
     if not ctx.voice_client:
@@ -483,7 +522,7 @@ async def leave(ctx):
         await ctx.voice_client.disconnect()
         await  ctx.send("Saí do canal.")
 
-@bot.command()
+@bot.hybrid_command()
 @commands.guild_only()
 async def beep(ctx):
     if not ctx.author.voice:
@@ -511,5 +550,148 @@ async def beep(ctx):
         print(f"Fim do beep | erro={e} | can_encrypt={conn.can_encrypt} | status={getattr(s2, 'status', None)} | ready={getattr(s2, 'ready', None)} | stats={s2.get_encryption_stats().successes if s2 else None}")
     vc.play(fonte, after=fim)
 
+@bot.hybrid_command(aliases=["rm", "remover"], description="Remove uma música da fila pelo número")
+@commands.guild_only()
+async def remove(ctx, numero: int):
+    fila = filas.get(ctx.guild.id, [])
+    if not fila:
+        await ctx.send("A fila está vazia.")
+        return
+    if numero < 1 or numero > len(fila):
+        await ctx.send(f"Número inválido. Escolha entre 1 e {len(fila)}.")
+        return
+
+    removida = fila.pop(numero - 1)
+    await ctx.send(f"🗑️ Removida da fila (#{numero}): **{removida['titulo']}**")
+
+@bot.hybrid_command(description="Ativa ou desativa a ordem aleatória da fila")
+@commands.guild_only()
+async def autoshuffle(ctx):
+    gid = ctx.guild.id
+    if gid in autoshuffle_ativo:
+        autoshuffle_ativo.discard(gid)
+        await ctx.send("🔀 Auto-shuffle **desativado**.")
+    else:
+        autoshuffle_ativo.add(gid)
+        fila = filas.get(gid)
+        if fila:
+            random.shuffle(fila)
+        await ctx.send("🔀 Auto-shuffle **ativado** e fila embaralhada!")
+
+async def recomendar_musica(gid):
+    hist = historico_musicas.get(gid, [])
+    if not hist:
+        return None
+
+    ultimas = [m["titulo"] for m in hist[-10:]]
+    prompt = (
+        "Com base nestas músicas, recomende APENAS UMA música parecida que NÃO esteja na lista.\n"
+        "Responda SOMENTE no formato: Artista - Nome da Música\n\n"
+        + "\n".join(ultimas)
+    )
+    try:
+        resp = await client.aio.models.generate_content(model=MODELO, contents=prompt)
+        sugestao = (resp.text or "").strip().splitlines()[0].strip(" -*\"'")
+        if not sugestao:
+            return None
+        loop = asyncio.get_running_loop()
+        encontradas = await loop.run_in_executor(None, extrair, f"ytsearch1:{sugestao}")
+        return encontradas[0] if encontradas else None
+    except Exception as e:
+        print(f"Erro no autoplay: {e}")
+        return None
+
+
+@bot.hybrid_command(description="Ativa ou desativa músicas recomendadas quando a fila acabar")
+@commands.guild_only()
+async def autoplay(ctx):
+    gid = ctx.guild.id
+    if gid in autoplay_ativo:
+        autoplay_ativo.discard(gid)
+        await ctx.send("🤖 Autoplay **desativado**.")
+    else:
+        autoplay_ativo.add(gid)
+        await ctx.send("🤖 Autoplay **ativado**!")
+
+@bot.hybrid_command(aliases=["prev", "anterior"], description="Toca a música anterior")
+@commands.guild_only()
+async def previous(ctx):
+    await ctx.defer()
+    gid = ctx.guild.id
+    hist = historico_musicas.get(gid)
+    if not hist:
+        await ctx.send("Não há nenhuma música anterior no histórico.")
+        return
+
+    if not ctx.author.voice:
+        await ctx.send("Entra em um canal de voz primeiro.")
+        return
+
+    anterior = hist.pop()
+    atual = tocando_agora.get(gid)
+    if atual:
+        filas.setdefault(gid, []).insert(0, atual)
+
+    proxima_forcada[gid] = anterior
+    await ctx.send(f"⏮️ Voltando para: **{anterior['titulo']}**")
+
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+        ignorar_historico.add(gid)
+        ctx.voice_client.stop()  # o "after" chama tocar_proxima automaticamente
+    else:
+        await tocar_proxima(ctx)
+
+INFO_COMANDOS = {
+    "play": ("Toca uma música ou playlist.", "/play <nome ou link>"),
+    "pause": ("Pausa a música atual.", "/pause"),
+    "resume": ("Retoma a música pausada.", "/resume"),
+    "skip": ("Pula para a próxima música.", "/skip"),
+    "previous": ("Volta para a música anterior.", "/previous"),
+    "remove": ("Remove uma música da fila pelo número.", "/remove <numero>"),
+    "queue": ("Mostra a fila de músicas.", "/queue [pagina]"),
+    "current-song": ("Mostra a música tocando agora.", "/current-song"),
+    "autoplay": ("Liga/desliga músicas recomendadas ao fim da fila.", "/autoplay"),
+    "autoshuffle": ("Liga/desliga a ordem aleatória da fila.", "/autoshuffle"),
+    "stop": ("Para a música e limpa a fila.", "/stop"),
+    "leave": ("Desconecta o bot do canal de voz.", "/leave"),
+    "ask": ("Faz uma pergunta para a IA.", "/ask <pergunta>"),
+    "reset": ("Apaga o histórico da IA no canal.", "/reset"),
+    "commands": ("Lista todos os comandos.", "/commands"),
+    "help": ("Explica como usar um comando.", "/help <comando>"),
+}
+
+@bot.hybrid_command(name="commands", aliases=["comandos"], description="Lista todos os comandos do bot")
+async def lista_comandos(ctx):
+    linhas = [f"`/{nome}` — {desc}" for nome, (desc, _) in INFO_COMANDOS.items()]
+    embed = discord.Embed(
+        title="📜 Comandos do Musik",
+        description="\n".join(linhas),
+        color=discord.Color.from_str("#1C5FF1"),
+    )
+    embed.set_footer(text="Use /help <comando> para ver como usar.")
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="help", aliases=["ajuda"], description="Mostra como usar um comando específico")
+@app_commands.describe(comando="Nome do comando (ex: play)")
+async def help_cmd(ctx, comando: str = None):
+    if not comando:
+        await ctx.send("Use `/help <comando>` (ex: `/help play`) ou `/commands` para ver a lista.")
+        return
+
+    chave = comando.lower().lstrip("/!")
+    cmd_obj = bot.get_command(chave)
+    nome_real = cmd_obj.name if cmd_obj else chave
+
+    if nome_real not in INFO_COMANDOS:
+        await ctx.send(f"Comando `{comando}` não encontrado. Use `/commands` para ver a lista.")
+        return
+
+    desc, uso = INFO_COMANDOS[nome_real]
+    embed = discord.Embed(
+        title=f"❓ /{nome_real}",
+        description=f"{desc}\n\n**Uso:** `{uso}`",
+        color=discord.Color.from_str("#1C5FF1"),
+    )
+    await ctx.send(embed=embed)
 
 bot.run(os.getenv("DISCORD_TOKEN"))
