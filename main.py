@@ -73,8 +73,10 @@ async def on_ready():
 
 # ---------- IA ----------
 
-@bot.command()
+@bot.hybrid_command(name="ask", description="Conversa com a IA ou pede para ela controlar a música")
+@app_commands.describe(pergunta="O que você quer perguntar ou pedir para o bot fazer")
 async def ask(ctx, *, pergunta: str):
+    await ctx.defer()
     agente = ARQUIVO_AGENTE.read_text(encoding="utf-8")
     cid = str(ctx.channel.id)
     msgs = memoria.get(cid, [])
@@ -83,24 +85,43 @@ async def ask(ctx, *, pergunta: str):
 
     chat = client.aio.chats.create(
         model=MODELO,
-        config=types.GenerateContentConfig(system_instruction=agente),
+        config=types.GenerateContentConfig(
+            system_instruction=agente,
+            tools=FERRAMENTAS_BOT,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
         history=[
             types.Content(role=m["role"], parts=[types.Part(text=m["text"])])
             for m in msgs
         ],
     )
 
-    async with ctx.typing():
-        try:
-            resposta = await chat.send_message(pergunta_com_nome)
-            texto = (resposta.text or "").strip()
-        except Exception as e:
-            print(f"Erro Gemini: {e}")
-            await ctx.send("Deu erro ao falar com o Gemini, tenta de novo daqui a pouco.")
-            return
+    try:
+        resposta = await chat.send_message(pergunta_com_nome)
+
+        # Ia pedindo pro bot
+
+        print("DEBUG function_calls:", resposta.function_calls)
+        if resposta.function_calls:
+            respostas_tools = []
+            for call in resposta.function_calls:
+                resultado = await executar_ferramenta(ctx, call.name, dict(call.args or {}))
+                respostas_tools.append(
+                    types.Part.from_function_response(
+                        name=call.name,
+                        response={"resultado": resultado},
+                    )
+                )
+            # Devolve o resultado para o Gemini gerar uma resposta natural
+            resposta = await chat.send_message(respostas_tools)
+
+        texto = (resposta.text or "").strip()
+    except Exception as e:
+        print(f"Erro Gemini: {e}")
+        await ctx.send("Deu erro ao falar com o Gemini, tenta de novo daqui a pouco.")
+        return
 
     if not texto:
-        await ctx.send("O Gemini não retornou resposta.")
         return
 
     msgs += [{"role": "user", "text": pergunta_com_nome}, {"role": "model", "text": texto}]
@@ -340,7 +361,8 @@ async def tocar_proxima(ctx):
 @bot.hybrid_command()
 @commands.guild_only()
 async def play(ctx, *, busca: str):
-    await ctx.defer()
+    if ctx.interaction and not ctx.interaction.response.is_done():
+        await ctx.defer()
     if not ctx.author.voice:
         await ctx.send("Entra em um canal de voz primeiro.")
         return
@@ -616,7 +638,8 @@ async def autoplay(ctx):
 @bot.hybrid_command(aliases=["prev", "anterior"], description="Toca a música anterior")
 @commands.guild_only()
 async def previous(ctx):
-    await ctx.defer()
+    if ctx.interaction and not ctx.interaction.response.is_done():
+        await ctx.defer()
     gid = ctx.guild.id
     hist = historico_musicas.get(gid)
     if not hist:
@@ -693,5 +716,81 @@ async def help_cmd(ctx, comando: str = None):
         color=discord.Color.from_str("#1C5FF1"),
     )
     await ctx.send(embed=embed)
+
+    # -------------------- Ferramentas da IA --------------------
+
+def cmd_play(busca: str):
+    """Toca uma música ou playlist no canal de voz pelo nome ou link."""
+
+def cmd_pause():
+    """Pausa a música que está tocando."""
+
+def cmd_resume():
+    """Retoma a música pausada."""
+
+def cmd_skip():
+    """Pula para a próxima música da fila."""
+
+def cmd_previous():
+    """Volta para a música anterior."""
+
+def cmd_stop():
+    """Para a reprodução e limpa a fila."""
+
+def cmd_leave():
+    """Desconecta o bot do canal de voz. Use sempre que o usuário pedir para sair da call, sair do canal, desconectar, vazar ou ir embora."""
+
+def cmd_queue(pagina: int = 1):
+    """Mostra a fila de músicas atual."""
+
+def cmd_current_song():
+    """Mostra qual música está tocando agora."""
+
+def cmd_remove(numero: int):
+    """Remove uma música da fila pelo número dela."""
+
+def cmd_autoplay():
+    """Ativa ou desativa o autoplay (recomendações automáticas)."""
+
+def cmd_autoshuffle():
+    """Ativa ou desativa o modo aleatório da fila."""
+
+
+FERRAMENTAS_BOT = [
+    cmd_play, cmd_pause, cmd_resume, cmd_skip, cmd_previous,
+    cmd_stop, cmd_leave, cmd_queue, cmd_current_song,
+    cmd_remove, cmd_autoplay, cmd_autoshuffle,
+]
+
+async def executar_ferramenta(ctx, nome: str, args: dict) -> str:
+    if not ctx.guild:
+        return "Comandos de música só funcionam dentro de um servidor."
+
+    mapa = {
+        "cmd_play": lambda: ctx.invoke(play, busca=args["busca"]),
+        "cmd_pause": lambda: ctx.invoke(pause),
+        "cmd_resume": lambda: ctx.invoke(resume),
+        "cmd_skip": lambda: ctx.invoke(skip),
+        "cmd_previous": lambda: ctx.invoke(previous),
+        "cmd_stop": lambda: ctx.invoke(stop),
+        "cmd_leave": lambda: ctx.invoke(leave),
+        "cmd_queue": lambda: ctx.invoke(queue, pagina=int(args.get("pagina", 1))),
+        "cmd_current_song": lambda: ctx.invoke(current_song),
+        "cmd_remove": lambda: ctx.invoke(remove, numero=int(args["numero"])),
+        "cmd_autoplay": lambda: ctx.invoke(autoplay),
+        "cmd_autoshuffle": lambda: ctx.invoke(autoshuffle),
+    }
+
+    acao = mapa.get(nome)
+    if not acao:
+        return f"Comando {nome} não encontrado."
+
+    try:
+        await acao()
+        return f"Comando {nome} executado com sucesso."
+    except Exception as e:
+        print(f"Erro ao executar {nome} via IA: {e}")
+        return f"Erro ao executar {nome}: {e}"
+
 
 bot.run(os.getenv("DISCORD_TOKEN"))
