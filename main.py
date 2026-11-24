@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,6 +19,8 @@ from spotipy.oauth2 import SpotifyOAuth
 import yt_dlp
 import random
 from discord import app_commands
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 load_dotenv()
 
@@ -32,6 +35,8 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODELO = "gemini-3.5-flash-lite"
 
 carregando = set()
+
+logging.getLogger("spotipy").setLevel(logging.CRITICAL)
 
 sp = None
 if os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET"):
@@ -141,11 +146,9 @@ async def reset(ctx):
 
 # ---------- MÚSICA ----------
 
-LIMITE_PLAYLIST = 200
-
 YDL_OPTS: Any = {
     "format": "bestaudio/best",
-    "noplaylist": True,            # <-- Deixe True!
+    "noplaylist": True,
     "extract_flat": "in_playlist",
     "quiet": True,
     "default_search": "ytsearch",
@@ -159,6 +162,165 @@ autoplay_ativo = set()
 autoshuffle_ativo = set()
 proxima_forcada = {}
 ignorar_historico = set()
+
+
+def obter_hash_pathfinder(sp_id):
+    """Busca o sha256Hash atual do fetchPlaylist direto do bundle do Web Player do Spotify."""
+    try:
+        req = Request(f"https://open.spotify.com/playlist/{sp_id}", headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as r:
+            pagina_html = r.read().decode("utf-8", errors="ignore")
+        js_urls = re.findall(r'https://open\.spotifycdn\.com/cdn/build/web-player/[^"\']+\.js', pagina_html)
+        for js_url in js_urls:
+            if "web-player" in js_url or "xpui" in js_url:
+                req_js = Request(js_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req_js, timeout=10) as r_js:
+                    js_txt = r_js.read().decode("utf-8", errors="ignore")
+                m_hash = re.search(r'"fetchPlaylist","query","([a-f0-9]{64})"', js_txt)
+                if m_hash:
+                    return m_hash.group(1)
+    except Exception:
+        pass
+    return "7982b11e21535cd2594badc40030b745671b61a1fa66766e569d45e6364f3422"
+
+
+def consultar_pathfinder(sp_id, token, sha_hash, offset=0, limit=100):
+    variables = {
+        "uri": f"spotify:playlist:{sp_id}",
+        "offset": offset,
+        "limit": limit,
+        "enableWatchFeedEntrypoint": False,
+    }
+    extensions = {
+        "persistedQuery": {
+            "version": 1,
+            "sha256Hash": sha_hash,
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "App-Platform": "WebPlayer",
+        "Origin": "https://open.spotify.com",
+        "Referer": f"https://open.spotify.com/playlist/{sp_id}",
+        "User-Agent": "Mozilla/5.0",
+    }
+    # Tenta v2 (POST) e v1 (GET)
+    try:
+        body = json.dumps({
+            "variables": variables,
+            "operationName": "fetchPlaylist",
+            "extensions": extensions,
+        }).encode("utf-8")
+        req = Request(
+            "https://api-partner.spotify.com/pathfinder/v2/query",
+            data=body,
+            headers={**headers, "Content-Type": "application/json;charset=UTF-8"},
+            method="POST",
+        )
+        with urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8", errors="ignore"))
+    except Exception:
+        params = urlencode({
+            "operationName": "fetchPlaylist",
+            "variables": json.dumps(variables),
+            "extensions": json.dumps(extensions),
+        })
+        req = Request(f"https://api-partner.spotify.com/pathfinder/v1/query?{params}", headers=headers)
+        with urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8", errors="ignore"))
+
+
+def extrair_playlist_embed(sp_id, url_original):
+    embed_url = f"https://open.spotify.com/embed/playlist/{sp_id}"
+    req = Request(embed_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=10) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not m:
+        return []
+
+    dados = json.loads(m.group(1))
+    state = dados.get("props", {}).get("pageProps", {}).get("state", {})
+    token = (
+        state.get("settings", {}).get("session", {}).get("accessToken")
+        or state.get("session", {}).get("accessToken")
+    )
+
+    entidade = state.get("data", {}).get("entity", {})
+    faixas = entidade.get("trackList", [])
+
+    # Se a playlist tiver 100+ músicas, usa a API interna Pathfinder do Web Player para puxar todas (400+, 800+)
+    if token and len(faixas) >= 100:
+        for sha_hash in (
+            "7982b11e21535cd2594badc40030b745671b61a1fa66766e569d45e6364f3422",
+            "b39f62e9b566aa849b1780927de1450f47e02c54bbf1e66e513f5bffc837a516",
+            obter_hash_pathfinder(sp_id),
+        ):
+            try:
+                musicas = []
+                offset = 0
+                limit = 100
+                while True:
+                    pag = consultar_pathfinder(sp_id, token, sha_hash, offset=offset, limit=limit)
+                    content = (
+                        pag.get("data", {}).get("playlistV2", {}).get("content")
+                        or pag.get("data", {}).get("playlistV2", {}).get("tracks")
+                        or {}
+                    )
+                    itens_pag = content.get("items", [])
+                    if not itens_pag:
+                        break
+                    for item in itens_pag:
+                        t_data = (
+                            item.get("itemV2", {}).get("data")
+                            or item.get("item", {}).get("data")
+                            or item.get("track")
+                            or {}
+                        )
+                        nome = (t_data.get("name") or "").strip()
+                        if not nome:
+                            continue
+                        art_items = t_data.get("artists", {}).get("items", [])
+                        artistas = ", ".join(
+                            (a.get("profile", {}).get("name") or a.get("name") or "")
+                            for a in art_items
+                            if (a.get("profile", {}).get("name") or a.get("name"))
+                        )
+                        titulo = f"{artistas} - {nome}" if artistas else nome
+                        uri = t_data.get("uri", "")
+                        link = f"https://open.spotify.com/track/{uri.split(':')[-1]}" if "spotify:track:" in uri else url_original
+                        musicas.append({
+                            "titulo": titulo,
+                            "pagina": link,
+                            "download": f"ytsearch1:{titulo}",
+                        })
+                    total = content.get("totalCount") or 0
+                    offset += len(itens_pag)
+                    if offset >= total or len(itens_pag) < limit:
+                        break
+                if len(musicas) > len(faixas):
+                    return musicas
+            except Exception as e:
+                print(f"DEBUG pathfinder ({sha_hash[:8]}): {e}")
+
+    musicas = []
+    for t in faixas:
+        nome = (t.get("title") or "").strip()
+        artistas = (t.get("subtitle") or "").replace("\xa0", " ").strip()
+        if not nome:
+            continue
+        titulo = f"{artistas} - {nome}" if artistas else nome
+        uri = t.get("uri", "")
+        link = f"https://open.spotify.com/track/{uri.split(':')[-1]}" if "spotify:track:" in uri else url_original
+        musicas.append({
+            "titulo": titulo,
+            "pagina": link,
+            "download": f"ytsearch1:{titulo}",
+        })
+
+    return musicas
 
 
 def extrair_spotify(url):
@@ -200,25 +362,27 @@ def extrair_spotify(url):
             })
 
     elif tipo == "playlist":
-        resultados = sp.playlist_items(sp_id, limit=50, additional_types=("track",))
-        itens = resultados["items"]
-        # Continua buscando até o final da playlist (seja 100, 800 ou mais músicas)
-        while resultados["next"]:
-            resultados = sp.next(resultados)
-            itens.extend(resultados["items"])
+        try:
+            resultados = sp.playlist_items(sp_id, limit=50, additional_types=("track",))
+            itens = resultados["items"]
+            while resultados["next"]:
+                resultados = sp.next(resultados)
+                itens.extend(resultados["items"])
 
-        for item in itens:
-            t = item.get("track") or item.get("item")
-            if not t or not t.get("name"):
-                continue
-            artistas = ", ".join(a["name"] for a in t.get("artists", []))
-            titulo = f"{artistas} - {t['name']}"
-            link = t.get("external_urls", {}).get("spotify", url)
-            musicas.append({
-                "titulo": titulo,
-                "pagina": link,
-                "download": f"ytsearch1:{titulo}",
-            })
+            for item in itens:
+                t = item.get("track") or item.get("item")
+                if not t or not t.get("name"):
+                    continue
+                artistas = ", ".join(a["name"] for a in t.get("artists", []))
+                titulo = f"{artistas} - {t['name']}"
+                link = t.get("external_urls", {}).get("spotify", url)
+                musicas.append({
+                    "titulo": titulo,
+                    "pagina": link,
+                    "download": f"ytsearch1:{titulo}",
+                })
+        except Exception:
+            return extrair_playlist_embed(sp_id, url)
 
     return musicas
 
@@ -380,10 +544,6 @@ async def play(ctx, *, busca: str):
             print(f"Erro na extração: {e}")
             await ctx.send("Não consegui achar essa música ou playlist.")
             return
-
-    if not musicas:
-        await ctx.send("Nenhuma música válida encontrada.")
-        return
 
     if not musicas:
         await ctx.send("Nenhuma música válida encontrada.")
@@ -738,7 +898,7 @@ def cmd_stop():
     """Para a reprodução e limpa a fila."""
 
 def cmd_leave():
-    """Desconecta o bot do canal de voz. Use sempre que o usuário pedir para sair da call, sair do canal, desconectar, vazar ou ir embora."""
+    """Para de tocar música se tiver tocando e limpa a fila, depois desconecta o bot do canal de voz. Use sempre que o usuário pedir para sair da call, sair do canal, desconectar, vazar ou ir embora."""
 
 def cmd_queue(pagina: int = 1):
     """Mostra a fila de músicas atual."""
